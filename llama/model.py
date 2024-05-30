@@ -300,3 +300,184 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+
+class AttentionONNX(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = 1
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
+
+        self.wq = nn.Linear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            # gather_output=False,
+            # init_method=lambda x: x,
+        )
+        self.wk = nn.Linear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            # gather_output=False,
+            # init_method=lambda x: x,
+        )
+        self.wv = nn.Linear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            # gather_output=False,
+            # init_method=lambda x: x,
+        )
+        self.wo = nn.Linear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            # input_is_parallel=True,
+            # init_method=lambda x: x,
+        )
+
+        self.kv_len = args.max_seq_len
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        # freqs_cis: torch.Tensor,
+        # mask: Optional[torch.Tensor],
+    ):
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        # self.cache_k = self.cache_k.to(xq)
+        # self.cache_v = self.cache_v.to(xq)
+
+        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        # keys = self.cache_k[:bsz, : start_pos + seqlen]
+        # values = self.cache_v[:bsz, : start_pos + seqlen]
+        keys = F.pad(xk, (0, 0, 0, 0, 0, self.kv_len - seqlen))
+        values = F.pad(xv, (0, 0, 0, 0, 0, self.kv_len - seqlen))
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # if mask is not None:
+            # scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
+
+
+class FeedForwardONNX(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+    ):
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(
+            dim, hidden_dim, bias=False#, gather_output=False, init_method=lambda x: x
+        )
+        self.w2 = nn.Linear(
+            hidden_dim, dim, bias=False#, input_is_parallel=True, init_method=lambda x: x
+        )
+        self.w3 = nn.Linear(
+            dim, hidden_dim, bias=False#, gather_output=False, init_method=lambda x: x
+        )
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class TransformerBlockONNX(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = AttentionONNX(args)
+        self.feed_forward = FeedForwardONNX(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+        )
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        # freqs_cis: torch.Tensor,
+        # mask: Optional[torch.Tensor],
+    ):
+        # h = self.attention(self.attention_norm(x), start_pos)
+        h = x + self.attention(self.attention_norm(x), start_pos)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+
+import json
+import io
+import onnx
+from onnxsim import simplify
+
+if __name__ == "__main__":
+    args = ModelArgs(**json.load(open("params.json")))
+    args.max_seq_len = 4096
+    query_len = 1
+    prompt_len = 512
+    model = TransformerBlockONNX(args).cuda()
+    model.eval()
+    model_name = "llama.onnx"
+    buffer = io.BytesIO()
+    input_tensor = torch.rand(1, query_len, args.dim).cuda()
+    # torch.onnx.export(model, (input_tensor, prompt_len), model_name, opset_version=13)
+    with torch.no_grad():
+        torch.onnx.export(model, (input_tensor, prompt_len), buffer, opset_version=13)
+        buffer.seek(0, 0)
+
+        onnx_model = onnx.load_model(buffer)
+        onnx_model, success = simplify(onnx_model)
+        assert success
+        new_buffer = io.BytesIO()
+        onnx.save(onnx_model, new_buffer)
+        buffer = new_buffer
+        buffer.seek(0, 0)
+
+    if buffer.getbuffer().nbytes > 0:
+        with open(model_name, "wb") as f:
+            f.write(buffer.read())
