@@ -341,15 +341,29 @@ class AttentionONNX(nn.Module):
             # init_method=lambda x: x,
         )
 
-        self.kv_len = args.max_seq_len
+        self.max_kv_len = args.max_seq_len
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
 
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
-        # freqs_cis: torch.Tensor,
-        # mask: Optional[torch.Tensor],
     ):
+        start_pos = self.max_kv_len - 1
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -359,16 +373,14 @@ class AttentionONNX(nn.Module):
 
         # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
 
-        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
-        # keys = self.cache_k[:bsz, : start_pos + seqlen]
-        # values = self.cache_v[:bsz, : start_pos + seqlen]
-        keys = F.pad(xk, (0, 0, 0, 0, 0, self.kv_len - seqlen))
-        values = F.pad(xv, (0, 0, 0, 0, 0, self.kv_len - seqlen))
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
@@ -440,12 +452,8 @@ class TransformerBlockONNX(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
-        # freqs_cis: torch.Tensor,
-        # mask: Optional[torch.Tensor],
     ):
-        # h = self.attention(self.attention_norm(x), start_pos)
-        h = x + self.attention(self.attention_norm(x), start_pos)
+        h = x + self.attention(self.attention_norm(x))
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -458,16 +466,16 @@ from onnxsim import simplify
 if __name__ == "__main__":
     args = ModelArgs(**json.load(open("params.json")))
     args.max_seq_len = 4096
+    args.max_batch_size = 16
     query_len = 1
     prompt_len = 512
     model = TransformerBlockONNX(args).cuda()
     model.eval()
     model_name = "llama.onnx"
     buffer = io.BytesIO()
-    input_tensor = torch.rand(1, query_len, args.dim).cuda()
-    # torch.onnx.export(model, (input_tensor, prompt_len), model_name, opset_version=13)
+    input_tensor = torch.rand(args.max_batch_size, query_len, args.dim).cuda()
     with torch.no_grad():
-        torch.onnx.export(model, (input_tensor, prompt_len), buffer, opset_version=13)
+        torch.onnx.export(model, input_tensor, buffer, opset_version=13)
         buffer.seek(0, 0)
 
         onnx_model = onnx.load_model(buffer)
