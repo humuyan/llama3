@@ -402,6 +402,46 @@ class AttentionONNX(nn.Module):
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
+    
+class QKVMemboundBaseline(AttentionONNX):
+    def __init__(self, args: ModelArgs):
+        super().__init__(args)
+    
+    def forward(self, xq, xk, xv):
+        start_pos = self.max_kv_len - 1
+        bsz, seqlen, _ = xq.shape
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        # The following part is unnecessary and can be eliminated by our optimization
+        # return
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        keys = keys.transpose(2, 3)
+        return xq, keys, values
 
 
 class FeedForwardONNX(nn.Module):
@@ -465,37 +505,39 @@ from tqdm import tqdm
 from time import time
 
 if __name__ == "__main__":
-    # torch_maia.load_firmware(0)
-    # maia_athena.get_nepal_device(0).set_global_hbm_limit(int(40e9))
+    torch_maia.load_firmware(0)
+    maia_athena.get_nepal_device(0).set_global_hbm_limit(int(40e9))
+    torch.set_default_dtype(torch.bfloat16)
     args = ModelArgs(**json.load(open("params.json")))
     args.max_seq_len = 4096
-    args.max_batch_size = 16
+    args.max_batch_size = 1
     query_len = 1
     prompt_len = 512
-    model = TransformerBlockONNX(args).to("maia")
+    n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+    head_dim = args.dim // args.n_heads
+    # model = TransformerBlockONNX(args).to("maia")
+    model = QKVMemboundBaseline(args).to("maia")
     model.eval()
     # model = torch.compile(model)
-    input_tensor = torch.rand(args.max_batch_size, query_len, args.dim).to("maia")
-    # print(model(input_tensor).shape)
-    from torch.profiler import profile, record_function, ProfilerActivity
+    # input_tensor = (torch.rand(args.max_batch_size, query_len, args.dim).to("maia"),)
+    xq = torch.rand(args.max_batch_size, query_len, args.n_heads * head_dim).to("maia")
+    xk = torch.rand(args.max_batch_size, query_len, n_kv_heads * head_dim).to("maia")
+    xv = torch.rand(args.max_batch_size, query_len, n_kv_heads * head_dim).to("maia")
+    input_tensor = (xq, xk, xv)
+    # print(model(*input_tensor)[1].shape)
+    # exit()
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with record_function("model_inference"):
-            model(input_tensor)
-    print(prof.key_averages().table())
-    exit()
-
-    rounds = 10
+    rounds = 1000
 
     with torch.no_grad():
         # warm up
         for i in tqdm(range(rounds)):
-            model(input_tensor)
+            model(*input_tensor)
         #starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         # running
         tot = 0
         for i in tqdm(range(rounds)):
             start = time()
-            result = model(input_tensor)
+            result = model(*input_tensor)
             tot += time() - start
         print(tot / rounds * 1000, "ms")

@@ -176,13 +176,13 @@ def bench_flash_attention():
         # warm up
         for _ in tqdm(range(rounds)):
             fn()
-        torch_maia.streams.current_stream().synchronize()
+            torch_maia.streams.current_stream().synchronize()
         # running
         tot = 0
         start = time()
         for _ in tqdm(range(rounds)):
             fn()
-        torch_maia.streams.current_stream().synchronize()
+            torch_maia.streams.current_stream().synchronize()
         tot = time() - start
         print(tot / rounds * 1000, "ms")
 
