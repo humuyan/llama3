@@ -464,6 +464,7 @@ import onnx
 from onnxsim import simplify
 
 if __name__ == "__main__":
+    torch.set_default_dtype(torch.bfloat16)
     args = ModelArgs(**json.load(open("params.json")))
     args.max_seq_len = 4096
     args.max_batch_size = 16
@@ -474,18 +475,40 @@ if __name__ == "__main__":
     model_name = "llama.onnx"
     buffer = io.BytesIO()
     input_tensor = torch.rand(args.max_batch_size, query_len, args.dim).cuda()
-    with torch.no_grad():
-        torch.onnx.export(model, input_tensor, buffer, opset_version=13)
-        buffer.seek(0, 0)
+    if False:
+        rounds = 500
 
-        onnx_model = onnx.load_model(buffer)
-        onnx_model, success = simplify(onnx_model)
-        assert success
-        new_buffer = io.BytesIO()
-        onnx.save(onnx_model, new_buffer)
-        buffer = new_buffer
-        buffer.seek(0, 0)
+        from tqdm import tqdm
+        from time import time
+        model = torch.compile(model)
+        with torch.no_grad():
+            # warm up
+            for i in tqdm(range(rounds)):
+                model(input_tensor)
+                torch.cuda.synchronize()
+            #starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            # running
+            tot = 0
+            for i in tqdm(range(rounds)):
+                torch.cuda.synchronize()
+                start = time()
+                result = model(input_tensor)
+                torch.cuda.synchronize()
+                tot += time() - start
+            print(tot / rounds * 1000, "ms")
+    else:
+        with torch.no_grad():
+            torch.onnx.export(model, input_tensor, buffer, opset_version=13)
+            buffer.seek(0, 0)
 
-    if buffer.getbuffer().nbytes > 0:
-        with open(model_name, "wb") as f:
-            f.write(buffer.read())
+            onnx_model = onnx.load_model(buffer)
+            onnx_model, success = simplify(onnx_model)
+            assert success
+            new_buffer = io.BytesIO()
+            onnx.save(onnx_model, new_buffer)
+            buffer = new_buffer
+            buffer.seek(0, 0)
+
+        if buffer.getbuffer().nbytes > 0:
+            with open(model_name, "wb") as f:
+                f.write(buffer.read())
