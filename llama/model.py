@@ -1,5 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
+import os
+os.environ["PJRT_DEVICE"] = "CUDA"
+os.environ["GPU_NUM_DEVICES"]="1"
 
 import math
 from dataclasses import dataclass
@@ -14,6 +17,7 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 from torch import nn
+# from flash_attn import flash_attn_func
 
 
 @dataclass
@@ -133,7 +137,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -141,7 +145,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
 
     def forward(
         self,
@@ -349,7 +353,7 @@ class AttentionONNX(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -357,7 +361,7 @@ class AttentionONNX(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
 
     def forward(
         self,
@@ -400,6 +404,9 @@ class AttentionONNX(nn.Module):
             # scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        """
+        output = flash_attn_func(xq, keys, values)
+        """
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -462,40 +469,51 @@ import json
 import io
 import onnx
 from onnxsim import simplify
+import sys
+import time
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
+    if sys.argv[1] == "profile-xla":
+        import torch_xla
+        torch.set_default_device(torch_xla.device())
+    else:
+        torch.set_default_device("cuda")
     args = ModelArgs(**json.load(open("params.json")))
     args.max_seq_len = 4096
-    args.max_batch_size = 16
+    args.max_batch_size = int(sys.argv[2])
     query_len = 1
     prompt_len = 512
-    model = TransformerBlockONNX(args).cuda()
+    model = TransformerBlockONNX(args)
     model.eval()
-    model_name = "llama.onnx"
+    model_name = f"llama_bs{args.max_batch_size}.onnx"
     buffer = io.BytesIO()
-    input_tensor = torch.rand(args.max_batch_size, query_len, args.dim).cuda()
-    if False:
-        rounds = 500
-
-        from tqdm import tqdm
-        from time import time
+    input_tensor = torch.rand(args.max_batch_size, query_len, args.dim)
+    warm_up = 1000
+    test = 1000
+    if sys.argv[1] == "profile":
         model = torch.compile(model)
-        with torch.no_grad():
-            # warm up
-            for i in tqdm(range(rounds)):
-                model(input_tensor)
-                torch.cuda.synchronize()
-            #starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            # running
-            tot = 0
-            for i in tqdm(range(rounds)):
-                torch.cuda.synchronize()
-                start = time()
-                result = model(input_tensor)
-                torch.cuda.synchronize()
-                tot += time() - start
-            print(tot / rounds * 1000, "ms")
+        for _ in range(warm_up):
+            model(input_tensor)
+            torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(test):
+            model(input_tensor)
+            torch.cuda.synchronize()
+        end = time.time()
+        print(f"Time: {(end - start) / test * 1e3:.4f} ms")
+    elif sys.argv[1] == "profile-xla":
+        import torch_xla.core.xla_model as xm
+        model = torch.compile(model, backend="openxla")
+        for _ in range(warm_up):
+            model(input_tensor)
+            xm.mark_step()
+        start = time.time()
+        for _ in range(test):
+            model(input_tensor)
+            xm.mark_step()
+        end = time.time()
+        print(f"Time: {(end - start) / test * 1e3:.4f} ms")
     else:
         with torch.no_grad():
             torch.onnx.export(model, input_tensor, buffer, opset_version=13)
