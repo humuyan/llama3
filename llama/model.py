@@ -493,10 +493,18 @@ if __name__ == "__main__":
     test = 1000
     if sys.argv[1] == "profile":
         model = torch.compile(model)
-        from torch._inductor.utils import print_performance
 
         torch.cuda.reset_peak_memory_stats()
-        print_performance(lambda: model(input_tensor), times=test, repeat=10, baseline=1e-3)
+        with torch.no_grad():
+            for _ in range(warm_up):
+                model(input_tensor)
+                torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(test):
+                model(input_tensor)
+                torch.cuda.synchronize()
+            end = time.time()
+            print(f"Time: {(end - start) / test * 1e3:.4f} ms")
         peak_mem = torch.cuda.max_memory_allocated()
         print(f"Peak GPU memory usage {peak_mem/1e6:.3f} MB")
     elif sys.argv[1] == "profile-xla":
