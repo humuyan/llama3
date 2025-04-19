@@ -17,7 +17,7 @@ from fairscale.nn.model_parallel.layers import (
     VocabParallelEmbedding,
 )
 from torch import nn
-# from flash_attn import flash_attn_func
+from flash_attn import flash_attn_func
 
 
 @dataclass
@@ -394,6 +394,7 @@ class AttentionONNX(nn.Module):
             values, self.n_rep
         )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
+        """
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(
@@ -406,7 +407,6 @@ class AttentionONNX(nn.Module):
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         """
         output = flash_attn_func(xq, keys, values)
-        """
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -493,15 +493,12 @@ if __name__ == "__main__":
     test = 1000
     if sys.argv[1] == "profile":
         model = torch.compile(model)
-        for _ in range(warm_up):
-            model(input_tensor)
-            torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(test):
-            model(input_tensor)
-            torch.cuda.synchronize()
-        end = time.time()
-        print(f"Time: {(end - start) / test * 1e3:.4f} ms")
+        from torch._inductor.utils import print_performance
+
+        torch.cuda.reset_peak_memory_stats()
+        print_performance(lambda: model(input_tensor), times=test, repeat=10, baseline=1e-3)
+        peak_mem = torch.cuda.max_memory_allocated()
+        print(f"Peak GPU memory usage {peak_mem/1e6:.3f} MB")
     elif sys.argv[1] == "profile-xla":
         import torch_xla.core.xla_model as xm
         model = torch.compile(model, backend="openxla")
